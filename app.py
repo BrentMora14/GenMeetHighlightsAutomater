@@ -1,5 +1,5 @@
 """
-Canva Presentation Automation
+UP CURSOR GenMeet Highlights Automater
   Tab 1 — Canva PPTX  →  Google Doc (formatted outline)
   Tab 2 — Google Doc  →  Canva Bulk Create CSV
 """
@@ -20,7 +20,7 @@ from pptx.enum.shapes import PP_PLACEHOLDER
 # ══════════════════════════════════════════════════════════════════════════════
 
 st.set_page_config(
-    page_title="Canva Automation",
+    page_title="UP CURSOR GenMeet Highlights Automater",
     page_icon="🎨",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -432,7 +432,7 @@ def gdoc_read_lines(doc_id: str) -> list[str]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CSV GENERATION
+# CSV GENERATION — GenMeet section-aware
 # ══════════════════════════════════════════════════════════════════════════════
 
 _ROMAN_RE = re.compile(r"^(M{0,4}(?:CM|CD|D?C{0,3})(?:XC|XL|L?X{0,3})(?:IX|IV|V?I{0,3}))\.\s+", re.I)
@@ -441,7 +441,21 @@ _NUM_RE   = re.compile(r"^\d+\.\s+")
 _LOWER_RE = re.compile(r"^[a-z]\)\s+")
 _PAREN_RE = re.compile(r"^\(\d+\)\s+")
 
+# Fixed section prefixes with their keyword triggers (case-insensitive substring match).
+# Order here defines the column order in the output CSV.
+SECTION_KEYWORDS: dict[str, list[str]] = {
+    "Mem":  ["mem"],
+    "Exec": ["exec"],
+    "Info": ["info"],
+    "Acti": ["acti"],
+    "Exte": ["exte"],
+    "Fin":  ["fin"],
+    "Acad": ["acad"],
+    "Rex":  ["rex"],
+}
+
 def _parse_level(line: str) -> tuple[int, str]:
+    """Detect outline level from prefix and return (level, bare_text)."""
     s = line.lstrip()
     if _ROMAN_RE.match(s): return 0, _ROMAN_RE.sub("", s).strip()
     if _ALPHA_RE.match(s): return 1, _ALPHA_RE.sub("", s).strip()
@@ -450,45 +464,95 @@ def _parse_level(line: str) -> tuple[int, str]:
     if _PAREN_RE.match(s): return 4, _PAREN_RE.sub("", s).strip()
     return -1, s
 
-def parse_slides_from_lines(lines: list[str]) -> list[dict]:
-    slides, current = [], None
+def _match_section_prefix(title: str) -> str | None:
+    """Return the section prefix whose keyword appears in the title, or None."""
+    t = title.lower()
+    for prefix, keywords in SECTION_KEYWORDS.items():
+        if any(kw in t for kw in keywords):
+            return prefix
+    return None
+
+def _format_body(lines: list[str]) -> str:
+    """Join body lines as a bulleted list. Always prefixed with • for consistency."""
+    return "\n".join(f"• {ln}" for ln in lines)
+
+def parse_meeting_sections(lines: list[str]) -> dict[str, dict]:
+    """
+    Parse outline lines into a dict keyed by section prefix:
+        {
+          "Mem":  {"heading": "...", "topics": [("Topic text", "• body\n• body"), ...]},
+          "Exec": {"heading": "...", "topics": [...]},
+          ...
+        }
+
+    Levels A. (1) → Topic
+    Levels 1. / a) / (1) nested under a topic → all collected as body bullet lines.
+    """
+    sections: dict[str, dict] = {}
+    current_prefix: str | None = None
+    current_topic:  str | None = None
+    current_bodies: list[str]  = []
+
+    def _flush_topic():
+        """Save the buffered topic+bodies into the current section."""
+        if current_prefix and current_topic is not None:
+            body_text = _format_body(current_bodies)
+            sections[current_prefix]["topics"].append((current_topic, body_text))
+
     for line in lines:
         lvl, text = _parse_level(line)
         if lvl < 0:
             continue
-        if lvl == 0:
-            current = {"title": text, "points": [], "subpoints": [], "details": [], "notes": []}
-            slides.append(current)
-        elif current is None:
-            continue
-        elif lvl == 1: current["points"].append(text)
-        elif lvl == 2: current["subpoints"].append(text)
-        elif lvl == 3: current["details"].append(text)
-        elif lvl == 4: current["notes"].append(text)
-    return slides
 
-def generate_csv_bytes(slides: list[dict]) -> tuple[bytes, list[str]]:
-    max_pts  = max((len(s["points"])    for s in slides), default=0)
-    max_sub  = max((len(s["subpoints"]) for s in slides), default=0)
-    max_det  = max((len(s["details"])   for s in slides), default=0)
-    max_note = max((len(s["notes"])     for s in slides), default=0)
+        if lvl == 0:                                   # Roman numeral → new section
+            _flush_topic()
+            current_topic  = None
+            current_bodies = []
+            prefix = _match_section_prefix(text)
+            current_prefix = prefix
+            if prefix:
+                sections[prefix] = {"heading": text, "topics": []}
 
-    headers = ["slide_title"]
-    headers += [f"point_{i}"    for i in range(1, max_pts  + 1)]
-    headers += [f"subpoint_{i}" for i in range(1, max_sub  + 1)]
-    headers += [f"detail_{i}"   for i in range(1, max_det  + 1)]
-    headers += [f"note_{i}"     for i in range(1, max_note + 1)]
+        elif lvl == 1 and current_prefix:              # A. → new topic within section
+            _flush_topic()
+            current_topic  = text
+            current_bodies = []
+
+        elif lvl >= 2 and current_prefix and current_topic is not None:
+            # 1. / a) / (1) → body content for the current topic
+            current_bodies.append(text)
+
+    _flush_topic()                                     # flush final topic
+    return sections
+
+
+def generate_meeting_csv(sections: dict[str, dict]) -> tuple[bytes, list[str]]:
+    """
+    Produce a single-row CSV where columns are:
+        {prefix} Heading | {prefix} Topic 1 | {prefix} Body 1 | {prefix} Topic 2 | …
+    Column count per section is driven by how many topics that section actually has.
+    Sections are ordered by SECTION_KEYWORDS definition.
+    """
+    headers: list[str] = []
+    for prefix in SECTION_KEYWORDS:
+        data = sections.get(prefix, {"heading": "", "topics": []})
+        headers.append(f"{prefix} Heading")
+        for i in range(1, len(data["topics"]) + 1):
+            headers.append(f"{prefix} Topic {i}")
+            headers.append(f"{prefix} Body {i}")
+
+    row: dict[str, str] = {}
+    for prefix in SECTION_KEYWORDS:
+        data = sections.get(prefix, {"heading": "", "topics": []})
+        row[f"{prefix} Heading"] = data["heading"]
+        for i, (topic, body) in enumerate(data["topics"], 1):
+            row[f"{prefix} Topic {i}"] = topic
+            row[f"{prefix} Body {i}"]  = body
 
     buf = io.StringIO()
     writer = csv.DictWriter(buf, fieldnames=headers, extrasaction="ignore")
     writer.writeheader()
-    for slide in slides:
-        row: dict = {"slide_title": slide["title"]}
-        for i, t in enumerate(slide["points"],    1): row[f"point_{i}"]    = t
-        for i, t in enumerate(slide["subpoints"], 1): row[f"subpoint_{i}"] = t
-        for i, t in enumerate(slide["details"],   1): row[f"detail_{i}"]   = t
-        for i, t in enumerate(slide["notes"],     1): row[f"note_{i}"]     = t
-        writer.writerow(row)
+    writer.writerow(row)
     return buf.getvalue().encode("utf-8"), headers
 
 
@@ -498,7 +562,7 @@ def generate_csv_bytes(slides: list[dict]) -> tuple[bytes, list[str]]:
 
 st.markdown("""
 <div class="top-header">
-  <h1>🎨 Canva Presentation Automation</h1>
+  <h1>🎨 UP CURSOR GenMeet Highlights Automater</h1>
   <p>Extract slide text → format into an outline → push to Google Docs → generate Canva Bulk Create CSV</p>
   <br>
   <span class="badge">100% Free</span>
@@ -654,74 +718,71 @@ with tab2:
 
     # ── Generate CSV ──────────────────────────────────────────────────────────
     if lines:
-        slides = parse_slides_from_lines(lines)
+        sections = parse_meeting_sections(lines)
 
-        if not slides:
-            st.warning("No slides detected. Make sure the outline uses the Roman numeral format from Step 1.")
+        unmatched = [s for s in SECTION_KEYWORDS if s not in sections]
+        if unmatched:
+            st.warning(f"Could not match sections: {', '.join(unmatched)}. Check that the outline headings contain the expected keywords.")
+
+        if not sections:
+            st.warning("No sections detected. Make sure the outline uses Roman numeral headings that contain section keywords (Mem, Exec, Info, Acti, Exte, Fin, Acad, Rex).")
         else:
-            st.markdown(f"**{len(slides)} slides parsed**")
+            total_topics = sum(len(d["topics"]) for d in sections.values())
+            st.markdown(f"**{len(sections)} sections · {total_topics} total topics parsed**")
 
-            csv_bytes, headers = generate_csv_bytes(slides)
+            csv_bytes, headers = generate_meeting_csv(sections)
 
-            # Preview as dataframe
-            import csv as csvlib
+            # ── Section preview cards ─────────────────────────────────────────
+            st.markdown("#### Section Preview")
+            for prefix in SECTION_KEYWORDS:
+                if prefix not in sections:
+                    continue
+                data = sections[prefix]
+                with st.expander(f"**{prefix}** — {data['heading']}  ({len(data['topics'])} topics)", expanded=False):
+                    for i, (topic, body) in enumerate(data["topics"], 1):
+                        st.markdown(f"**Topic {i}:** {topic}")
+                        st.code(body, language=None)
+
+            # ── CSV preview ───────────────────────────────────────────────────
+            st.markdown("#### CSV Preview")
             import pandas as pd
             df = pd.read_csv(io.BytesIO(csv_bytes))
-            st.markdown("#### CSV Preview")
-            st.dataframe(df, use_container_width=True, height=240)
+            st.dataframe(df.T.rename(columns={0: "Value"}), use_container_width=True, height=320)
+            st.caption("Transposed for readability — one column per section field, value on the right.")
 
             st.download_button(
                 label="⬇️  Download canva_bulk_create.csv",
                 data=csv_bytes,
                 file_name="canva_bulk_create.csv",
                 mime="text/csv",
-                use_container_width=False,
                 type="primary",
             )
 
-            # ── Canva instructions ────────────────────────────────────────────
+            # ── Canva field name table ────────────────────────────────────────
             st.markdown("---")
-            st.markdown("#### 🎨 How to use this CSV in Canva Bulk Create")
-
+            st.markdown("#### 🎨 Canva field names to connect in your template")
             st.markdown("""
 <div class="info-box">
-  Canva Bulk Create is a <strong>free built-in feature</strong> that fills a template from a CSV — one page per row.
-  Follow the steps below to auto-generate your presentation.
+  For each textbox in your Canva template, click it → <strong>Connect data</strong> → type the field name exactly as shown below.
+  Then go to <strong>Apps → Bulk Create → Upload CSV</strong>.
 </div>
 """, unsafe_allow_html=True)
 
-            with st.expander("📋 Step-by-step Canva setup (click to expand)", expanded=True):
-                st.markdown("""
-1. **Open your destination Canva template** (the design you want to fill).
-2. **Click a textbox** you want to auto-fill (e.g. the slide title box).
-3. In the top toolbar, click **"Connect data"** *(or go to Apps → Bulk Create → Get started)*.
-4. **Name the field exactly** as shown in the table below — then press Enter.
-5. Repeat for every textbox on the template (title, bullet 1, bullet 2, …).
-6. Go to **Apps → Bulk Create → Get started → Upload CSV**.
-7. Select `canva_bulk_create.csv`.
-8. Click **Continue** → Canva generates one page per row. ✅
-""")
+            rows_html = ""
+            for prefix in SECTION_KEYWORDS:
+                if prefix not in sections:
+                    continue
+                data    = sections[prefix]
+                n_topics = len(data["topics"])
+                rows_html += f"<tr><td colspan='2' style='background:#f5f3ff;font-weight:600;color:#4338ca;padding:.5rem .8rem'>{prefix} — {data['heading']}</td></tr>"
+                rows_html += f"<tr><td>Section heading textbox</td><td><span class='code-chip'>{prefix} Heading</span></td></tr>"
+                for i in range(1, n_topics + 1):
+                    rows_html += f"<tr><td>Topic {i} textbox</td><td><span class='code-chip'>{prefix} Topic {i}</span></td></tr>"
+                    rows_html += f"<tr><td>Body {i} textbox</td><td><span class='code-chip'>{prefix} Body {i}</span></td></tr>"
 
-                # Field name table
-                PURPOSE = {
-                    "slide_title": ("🔤 Slide / page title",     "The main heading textbox"),
-                    "point_":      ("• Main bullet (A. level)",  "Primary body bullet points"),
-                    "subpoint_":   ("  · Sub-bullet (1. level)", "Second-level bullet points"),
-                    "detail_":     ("    › Detail (a) level)",   "Third-level detail text"),
-                    "note_":       ("      ◦ Note ((1) level)",  "Deepest level notes"),
-                }
-                rows_html = ""
-                for h in headers:
-                    for prefix, (purpose, desc) in PURPOSE.items():
-                        if h.startswith(prefix):
-                            num = h.split("_")[-1] if h.split("_")[-1].isdigit() else ""
-                            label = f"{purpose} #{num}" if num else purpose
-                            rows_html += f"<tr><td>{label}</td><td><span class='code-chip'>{h}</span></td><td>{desc}</td></tr>"
-                            break
-
-                st.markdown(f"""
+            st.markdown(f"""
 <table class="field-table">
-  <thead><tr><th>Textbox purpose</th><th>Field name to enter in Canva</th><th>Description</th></tr></thead>
+  <thead><tr><th>Textbox purpose</th><th>Field name to enter in Canva</th></tr></thead>
   <tbody>{rows_html}</tbody>
 </table>
 """, unsafe_allow_html=True)
