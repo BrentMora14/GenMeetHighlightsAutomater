@@ -2,6 +2,7 @@
 UP CURSOR GenMeet Highlights Automater
   Tab 1 — Canva PPTX  →  Google Doc (formatted outline)
   Tab 2 — Google Doc  →  Canva Bulk Create CSV
+  Tab 3 — F2F + Zoom CSVs  →  Consolidated attendance
 """
 
 import csv
@@ -14,6 +15,7 @@ from typing import Optional
 import streamlit as st
 from pptx import Presentation
 from pptx.enum.shapes import PP_PLACEHOLDER
+import attendance as att
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PAGE CONFIG & CUSTOM CSS
@@ -576,7 +578,11 @@ st.markdown("""
 # TABS
 # ══════════════════════════════════════════════════════════════════════════════
 
-tab1, tab2 = st.tabs(["📄  Step 1 — PPTX → Google Doc", "📊  Step 2 — Google Doc → Canva CSV"])
+tab1, tab2, tab3 = st.tabs([
+    "📄  Step 1 — PPTX → Google Doc",
+    "📊  Step 2 — Google Doc → Canva CSV",
+    "🗂️  Attendance",
+])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -794,3 +800,119 @@ with tab2:
   Complete <strong>Step 1</strong> first, or upload an <code>outline.txt</code> file here directly.
 </div>
 """, unsafe_allow_html=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  TAB 3 — ATTENDANCE
+# ─────────────────────────────────────────────────────────────────────────────
+with tab3:
+    st.markdown('<div class="step-pill">③ Upload F2F and/or Zoom attendance files to consolidate</div>', unsafe_allow_html=True)
+
+    col_f2f, col_zoom = st.columns(2, gap="large")
+
+    with col_f2f:
+        st.markdown("#### F2F Attendance")
+        st.caption("CSV or Excel — columns: Surname, Nickname, Entry Time, Status")
+        f2f_file = st.file_uploader("Upload F2F file", type=["csv", "xlsx", "xls"], key="f2f_upload")
+
+    with col_zoom:
+        st.markdown("#### Zoom Attendance")
+        st.caption("CSV — columns: Nickname, Duration, Status")
+        zoom_file = st.file_uploader("Upload Zoom file", type=["csv"], key="zoom_upload")
+
+    if not f2f_file and not zoom_file:
+        st.markdown("""
+<div class="info-box">
+  Upload at least one file above.<br>
+  Both sources are optional — uploading only one will use that source's status directly.
+</div>
+""", unsafe_allow_html=True)
+    else:
+        try:
+            # ── Load & validate ───────────────────────────────────────────────
+            f2f_df  = att.load_f2f(f2f_file)   if f2f_file  else None
+            zoom_df = att.load_zoom(zoom_file)  if zoom_file else None
+
+            # ── Source previews ───────────────────────────────────────────────
+            with st.expander("Source data preview", expanded=False):
+                if f2f_df is not None:
+                    st.markdown("**F2F**")
+                    st.dataframe(
+                        f2f_df.drop(columns=["_nick_key"]),
+                        use_container_width=True, height=200,
+                    )
+                if zoom_df is not None:
+                    st.markdown("**Zoom** (deduplicated — reconnections merged)")
+                    st.dataframe(
+                        zoom_df.drop(columns=["_nick_key"]),
+                        use_container_width=True, height=200,
+                    )
+
+            # ── Consolidate ───────────────────────────────────────────────────
+            result = att.consolidate(f2f_df, zoom_df)
+
+            counts = result["Final Status"].value_counts()
+            n_att  = counts.get("Attendee", 0)
+            n_late = counts.get("Late",     0)
+            n_abs  = counts.get("Absent",   0)
+
+            # Summary metric chips
+            st.markdown(f"""
+<div style="display:flex;gap:1rem;margin:1rem 0">
+  <div class="card" style="flex:1;text-align:center">
+    <div style="font-size:1.8rem;font-weight:700;color:#15803d">{n_att}</div>
+    <div style="font-size:.8rem;color:#6b7280">Attendees</div>
+  </div>
+  <div class="card" style="flex:1;text-align:center">
+    <div style="font-size:1.8rem;font-weight:700;color:#854d0e">{n_late}</div>
+    <div style="font-size:.8rem;color:#6b7280">Late</div>
+  </div>
+  <div class="card" style="flex:1;text-align:center">
+    <div style="font-size:1.8rem;font-weight:700;color:#991b1b">{n_abs}</div>
+    <div style="font-size:.8rem;color:#6b7280">Absent</div>
+  </div>
+  <div class="card" style="flex:1;text-align:center">
+    <div style="font-size:1.8rem;font-weight:700;color:#1e40af">{len(result)}</div>
+    <div style="font-size:.8rem;color:#6b7280">Total</div>
+  </div>
+</div>
+""", unsafe_allow_html=True)
+
+            # ── Colour-coded result table ─────────────────────────────────────
+            STATUS_COLORS = {
+                "Attendee": "background-color:#dcfce7;color:#15803d;font-weight:600",
+                "Late":     "background-color:#fef9c3;color:#854d0e;font-weight:600",
+                "Absent":   "background-color:#fee2e2;color:#991b1b;font-weight:600",
+            }
+
+            rows_html = ""
+            for _, row in result.iterrows():
+                style = STATUS_COLORS.get(row["Final Status"], "")
+                rows_html += (
+                    f"<tr>"
+                    f"<td style='padding:.45rem .8rem;border-bottom:1px solid #f0f0f0'>{row['Nickname']}</td>"
+                    f"<td style='padding:.45rem .8rem;border-bottom:1px solid #f0f0f0;{style}'>{row['Final Status']}</td>"
+                    f"</tr>"
+                )
+
+            st.markdown(f"""
+<table class="field-table" style="margin-top:.5rem">
+  <thead><tr><th>Nickname</th><th>Final Status</th></tr></thead>
+  <tbody>{rows_html}</tbody>
+</table>
+""", unsafe_allow_html=True)
+
+            # ── Download ──────────────────────────────────────────────────────
+            csv_out = result.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                label="⬇️  Download consolidated_attendance.csv",
+                data=csv_out,
+                file_name="consolidated_attendance.csv",
+                mime="text/csv",
+                type="primary",
+            )
+
+        except ValueError as e:
+            st.error(f"Column error: {e}")
+        except Exception as e:
+            st.error(f"Unexpected error: {e}")
