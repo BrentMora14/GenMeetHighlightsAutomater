@@ -313,6 +313,72 @@ def outline_to_html_preview(outline: list[dict]) -> str:
     return '<div class="outline-box">' + "\n".join(lines) + "</div>"
 
 
+def outline_to_docx_bytes(outline: list[dict]) -> bytes:
+    """
+    Build a .docx where each outline item is its own paragraph, indented
+    with real tab characters (one \t per level) so copy-pasting into
+    Google Docs preserves the indent hierarchy.
+
+    Formatting applied:
+      level 0 (I.)  → bold, 13 pt
+      level 1 (A.)  → bold, 11 pt
+      level 2+      → normal weight, 11 pt
+    """
+    from docx import Document
+    from docx.shared import Pt
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
+
+    doc = Document()
+
+    # ── Strip the default empty first paragraph ───────────────────────────────
+    for p in doc.paragraphs:
+        p._element.getparent().remove(p._element)
+
+    # ── Remove space-after on Normal style so lines sit flush ─────────────────
+    style = doc.styles["Normal"]
+    style.paragraph_format.space_before = Pt(0)
+    style.paragraph_format.space_after  = Pt(0)
+
+    for item in outline:
+        lvl   = item["level"]
+        tabs  = "\t" * lvl
+        label = f"{tabs}{item['prefix']} {item['text']}"
+
+        para = doc.add_paragraph()
+        para.paragraph_format.space_before = Pt(2 if lvl == 0 else 0)
+        para.paragraph_format.space_after  = Pt(0)
+
+        run = para.add_run(label)
+        if lvl == 0:
+            run.bold      = True
+            run.font.size = Pt(13)
+        elif lvl == 1:
+            run.bold      = True
+            run.font.size = Pt(11)
+        else:
+            run.font.size = Pt(11)
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+    return buf.read()
+
+
+def read_outline_file(file) -> list[str]:
+    """
+    Read lines from an uploaded outline file.
+    Accepts both .docx (reads paragraphs) and .txt (splits on newline).
+    Tabs and spaces are both treated as indentation by _parse_level().
+    """
+    name = getattr(file, "name", "")
+    if name.lower().endswith(".docx"):
+        from docx import Document
+        doc = Document(file)
+        return [p.text for p in doc.paragraphs if p.text.strip()]
+    return file.read().decode("utf-8").splitlines()
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # GOOGLE DOCS HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
@@ -636,16 +702,16 @@ with tab1:
 
         # ── Download as text ─────────────────────────────────────────────────
         with dl_col:
-            st.markdown("##### 📥 Option A — Download as text")
-            plain_text = outline_to_plain_text(outline)
+            st.markdown("##### 📥 Option A — Download as Word doc")
+            docx_bytes = outline_to_docx_bytes(outline)
             st.download_button(
-                label="⬇️  Download outline.txt",
-                data=plain_text.encode("utf-8"),
-                file_name="outline.txt",
-                mime="text/plain",
+                label="⬇️  Download outline.docx",
+                data=docx_bytes,
+                file_name="outline.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                 use_container_width=True,
             )
-            st.caption("Use this in Tab 2 by uploading the .txt file, no Google account needed.")
+            st.caption("Tab-indented outline — open in Word or Google Docs, then copy-paste. Upload in Tab 2 to generate the Canva CSV.")
 
         # ── Push to Google Doc ────────────────────────────────────────────────
         with gdoc_col:
@@ -684,7 +750,7 @@ with tab2:
     gdocs_enabled2      = "gcp_service_account" in st.secrets
 
     source_options = ["From Step 1 (this session)"] if has_session_outline else []
-    source_options += ["Upload outline .txt file", "Google Doc ID"]
+    source_options += ["Upload outline file (.docx or .txt)", "Google Doc ID"]
     source = st.radio("Outline source", source_options, horizontal=True)
 
     lines: list[str] = []
@@ -693,11 +759,15 @@ with tab2:
         lines = st.session_state["outline_lines"]
         st.markdown(f'<div class="success-box">✅ Using outline from Step 1 — {len(lines)} lines loaded.</div>', unsafe_allow_html=True)
 
-    elif source == "Upload outline .txt file":
-        txt_file = st.file_uploader("Upload the outline.txt downloaded in Step 1", type=["txt"], key="txt_upload")
-        if txt_file:
-            lines = txt_file.read().decode("utf-8").split("\n")
-            st.success(f"Loaded {len(lines)} lines from file.")
+    elif source == "Upload outline file (.docx or .txt)":
+        outline_file = st.file_uploader(
+            "Upload the outline.docx (or .txt) downloaded in Step 1",
+            type=["docx", "txt"],
+            key="outline_upload",
+        )
+        if outline_file:
+            lines = read_outline_file(outline_file)
+            st.success(f"Loaded {len(lines)} lines from {outline_file.name}.")
 
     elif source == "Google Doc ID":
         default_id = st.session_state.get("last_doc_id", "")
@@ -709,7 +779,7 @@ with tab2:
         )
         if doc_id_input:
             if not gdocs_enabled2:
-                st.markdown('<div class="warn-box">⚠️ Google credentials not configured — cannot read Google Docs directly. Download the outline.txt from Step 1 and upload it instead.</div>', unsafe_allow_html=True)
+                st.markdown('<div class="warn-box">⚠️ Google credentials not configured — cannot read Google Docs directly. Download the outline.docx from Step 1 and upload it instead.</div>', unsafe_allow_html=True)
             else:
                 if st.button("📥 Load from Google Doc"):
                     with st.spinner("Reading Google Doc …"):
