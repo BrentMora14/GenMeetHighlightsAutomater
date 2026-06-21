@@ -274,7 +274,9 @@ def extract_slides(pptx_bytes: bytes) -> list[dict]:
 
 
 def build_numbered_outline(slides: list[dict]) -> list[dict]:
-    """Returns list of {level, prefix, text, formatted} dicts."""
+    """Returns list of {level, text, formatted} dicts.
+    formatted uses tab characters for indentation; no outline prefixes.
+    """
     raw = []
     for slide in slides:
         if slide["title"]:
@@ -282,21 +284,14 @@ def build_numbered_outline(slides: list[dict]) -> list[dict]:
         for p in slide["body"]:
             raw.append({"level": p["level"] + 1, "text": p["text"]})
 
-    counters: dict[int, int] = {}
-    result = []
-    for item in raw:
-        lvl = item["level"]
-        for k in list(counters):
-            if k > lvl: del counters[k]
-        counters[lvl] = counters.get(lvl, 0) + 1
-        prefix = OUTLINE_PREFIX.get(lvl, lambda n: "–")(counters[lvl])
-        result.append({
-            "level":     lvl,
-            "prefix":    prefix,
+    return [
+        {
+            "level":     item["level"],
             "text":      item["text"],
-            "formatted": f"{INDENT * lvl}{prefix} {item['text']}",
-        })
-    return result
+            "formatted": "\t" * item["level"] + item["text"],
+        }
+        for item in raw
+    ]
 
 
 def outline_to_plain_text(outline: list[dict]) -> str:
@@ -308,7 +303,9 @@ def outline_to_html_preview(outline: list[dict]) -> str:
     lines = []
     for item in outline:
         cls = css_cls[min(item["level"], 4)]
-        escaped = item["formatted"].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        # Tabs collapse in HTML — swap each for 4 spaces in the monospace preview
+        display = item["formatted"].replace("\t", "    ")
+        escaped = display.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
         lines.append(f'<span class="{cls}">{escaped}</span>')
     return '<div class="outline-box">' + "\n".join(lines) + "</div>"
 
@@ -343,7 +340,7 @@ def outline_to_docx_bytes(outline: list[dict]) -> bytes:
     for item in outline:
         lvl   = item["level"]
         tabs  = "\t" * lvl
-        label = f"{tabs}{item['prefix']} {item['text']}"
+        label = f"{tabs}{item['text']}"
 
         para = doc.add_paragraph()
         para.paragraph_format.space_before = Pt(2 if lvl == 0 else 0)
@@ -417,8 +414,8 @@ def gdoc_write_outline(outline: list[dict], title: str, share_email: Optional[st
     doc    = docs_svc.documents().create(body={"title": title}).execute()
     doc_id = doc["documentId"]
 
-    # Insert all text
-    full_text = outline_to_plain_text(outline)
+    # Insert all text — plain text only, no tabs; API handles indentation
+    full_text = "\n".join(item["text"] for item in outline)
     docs_svc.documents().batchUpdate(
         documentId=doc_id,
         body={"requests": [{"insertText": {"location": {"index": 1}, "text": full_text}}]},
@@ -428,7 +425,7 @@ def gdoc_write_outline(outline: list[dict], title: str, share_email: Optional[st
     fmt_requests = []
     char_idx = 1
     for i, item in enumerate(outline):
-        ln  = len(item["formatted"])
+        ln  = len(item["text"])
         lvl = item["level"]
         start, end = char_idx, char_idx + ln
 
@@ -523,14 +520,37 @@ SECTION_KEYWORDS: dict[str, list[str]] = {
 }
 
 def _parse_level(line: str) -> tuple[int, str]:
-    """Detect outline level from prefix and return (level, bare_text)."""
+    """
+    Detect outline level and return (level, bare_text).
+
+    Priority order:
+      1. Leading tabs   → level = tab count  (Tab 1 docx/session output)
+      2. Known prefix   → level from regex   (manually maintained Google Doc)
+      3. Non-blank, no tabs, no prefix → level 0 (top-level heading in tab format)
+      4. Blank          → -1, skip
+
+    Rule 3 is safe because in the tab-based format level-0 items genuinely
+    have no tabs; in the prefix-based Google Doc format any stray unprefixed
+    line gets tested against section keywords and silently skipped if it
+    doesn't match.
+    """
+    # ── Tab-indented (Tab 1 output) ───────────────────────────────────────────
+    stripped = line.lstrip("\t")
+    if len(stripped) < len(line):                 # had at least one leading tab
+        return len(line) - len(stripped), stripped.strip()
+
+    # ── Prefix-based (Google Doc source) ──────────────────────────────────────
     s = line.lstrip()
+    if not s:
+        return -1, s                              # blank line → skip
     if _ROMAN_RE.match(s): return 0, _ROMAN_RE.sub("", s).strip()
     if _ALPHA_RE.match(s): return 1, _ALPHA_RE.sub("", s).strip()
     if _NUM_RE.match(s):   return 2, _NUM_RE.sub("",   s).strip()
     if _LOWER_RE.match(s): return 3, _LOWER_RE.sub("", s).strip()
     if _PAREN_RE.match(s): return 4, _PAREN_RE.sub("", s).strip()
-    return -1, s
+
+    # ── No tabs, no prefix, non-blank → top-level heading ────────────────────
+    return 0, s
 
 def _match_section_prefix(title: str) -> str | None:
     """Return the section prefix whose keyword appears in the title, or None."""
