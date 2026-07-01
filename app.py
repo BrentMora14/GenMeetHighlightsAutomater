@@ -310,51 +310,129 @@ def outline_to_html_preview(outline: list[dict]) -> str:
     return '<div class="outline-box">' + "\n".join(lines) + "</div>"
 
 
-def outline_to_docx_bytes(outline: list[dict]) -> bytes:
-    """
-    Build a .docx where each outline item is its own paragraph, indented
-    with real tab characters (one \t per level) so copy-pasting into
-    Google Docs preserves the indent hierarchy.
+_BULLET_CHARS = ["•", "◦", "▪", "‣", "·"]
 
-    Formatting applied:
-      level 0 (I.)  → bold, 13 pt
-      level 1 (A.)  → bold, 11 pt
-      level 2+      → normal weight, 11 pt
+
+def _add_bullet_numbering(doc, max_level: int, num_id: int = 100, abstract_id: int = 100) -> int:
     """
-    from docx import Document
-    from docx.shared import Pt
+    Inject a single multilevel bullet-list definition (ilvl 0..max_level)
+    into the document's existing (initially empty) numbering part, and
+    return the numId to use when attaching bullets to paragraphs.
+
+    Word/Google Docs both represent outline nesting this way — a single
+    numId whose ilvl on each paragraph *is* the outline level — which is
+    exactly the convention read back by _docx_paragraph_level().
+    """
     from docx.oxml.ns import qn
     from docx.oxml import OxmlElement
 
+    numbering_el = doc.part.numbering_part.element
+
+    abstract_num = OxmlElement("w:abstractNum")
+    abstract_num.set(qn("w:abstractNumId"), str(abstract_id))
+
+    for i in range(max_level + 1):
+        lvl = OxmlElement("w:lvl")
+        lvl.set(qn("w:ilvl"), str(i))
+
+        start = OxmlElement("w:start")
+        start.set(qn("w:val"), "1")
+        num_fmt = OxmlElement("w:numFmt")
+        num_fmt.set(qn("w:val"), "bullet")
+        lvl_text = OxmlElement("w:lvlText")
+        lvl_text.set(qn("w:val"), _BULLET_CHARS[i % len(_BULLET_CHARS)])
+        lvl_jc = OxmlElement("w:lvlJc")
+        lvl_jc.set(qn("w:val"), "left")
+
+        p_pr = OxmlElement("w:pPr")
+        ind = OxmlElement("w:ind")
+        ind.set(qn("w:left"), str(360 * (i + 1)))
+        ind.set(qn("w:hanging"), "360")
+        p_pr.append(ind)
+
+        r_pr = OxmlElement("w:rPr")
+        r_fonts = OxmlElement("w:rFonts")
+        r_fonts.set(qn("w:ascii"), "Arial")
+        r_fonts.set(qn("w:hAnsi"), "Arial")
+        r_pr.append(r_fonts)
+
+        for el in (start, num_fmt, lvl_text, lvl_jc, p_pr, r_pr):
+            lvl.append(el)
+        abstract_num.append(lvl)
+
+    numbering_el.append(abstract_num)
+
+    num = OxmlElement("w:num")
+    num.set(qn("w:numId"), str(num_id))
+    abstract_num_id = OxmlElement("w:abstractNumId")
+    abstract_num_id.set(qn("w:val"), str(abstract_id))
+    num.append(abstract_num_id)
+    numbering_el.append(num)
+
+    return num_id
+
+
+def _set_bullet_level(paragraph, num_id: int, ilvl: int) -> None:
+    """Attach paragraph to the given numId at the given ilvl (= outline level)."""
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
+
+    p_pr = paragraph._p.get_or_add_pPr()
+    num_pr = OxmlElement("w:numPr")
+    ilvl_el = OxmlElement("w:ilvl")
+    ilvl_el.set(qn("w:val"), str(ilvl))
+    num_id_el = OxmlElement("w:numId")
+    num_id_el.set(qn("w:val"), str(num_id))
+    num_pr.append(ilvl_el)
+    num_pr.append(num_id_el)
+    p_pr.append(num_pr)
+
+
+def outline_to_docx_bytes(outline: list[dict]) -> bytes:
+    """
+    Build a .docx that mirrors real GenMeet minutes formatting:
+      level 0   → "Heading 2" style (new section)
+      level 1   → bulleted paragraph, bold (topic)
+      level 2+  → bulleted paragraph, normal weight, nested via ilvl
+
+    This is the same representation Google Docs itself produces (heading
+    style for section breaks, a single multilevel bullet list — via ilvl —
+    for everything else), so a .docx generated here round-trips cleanly
+    through read_outline_file() / _docx_paragraph_level() in Tab 2, and
+    also reads correctly if the person edits it in Word/Google Docs first.
+    """
+    from docx import Document
+    from docx.shared import Pt
+
     doc = Document()
 
-    # ── Strip the default empty first paragraph ───────────────────────────────
+    # ── Strip the default empty first paragraph ───────────────────────────
     for p in doc.paragraphs:
         p._element.getparent().remove(p._element)
 
-    # ── Remove space-after on Normal style so lines sit flush ─────────────────
+    # ── Remove space-after on Normal style so lines sit flush ─────────────
     style = doc.styles["Normal"]
     style.paragraph_format.space_before = Pt(0)
     style.paragraph_format.space_after  = Pt(0)
 
+    max_level = max((item["level"] for item in outline), default=0)
+    num_id = _add_bullet_numbering(doc, max_level=max(max_level, 1))
+
     for item in outline:
-        lvl   = item["level"]
-        tabs  = "\t" * lvl
-        label = f"{tabs}{item['text']}"
+        lvl  = item["level"]
+        text = item["text"]
+
+        if lvl == 0:
+            doc.add_paragraph(text, style="Heading 2")
+            continue
 
         para = doc.add_paragraph()
-        para.paragraph_format.space_before = Pt(2 if lvl == 0 else 0)
-        para.paragraph_format.space_after  = Pt(0)
+        para.paragraph_format.space_after = Pt(0)
+        _set_bullet_level(para, num_id, lvl)
 
-        run = para.add_run(label)
-        if lvl == 0:
-            run.bold      = True
-            run.font.size = Pt(13)
-        elif lvl == 1:
-            run.bold      = True
-            run.font.size = Pt(11)
-        else:
-            run.font.size = Pt(11)
+        run = para.add_run(text)
+        if lvl == 1:
+            run.bold = True
 
     buf = io.BytesIO()
     doc.save(buf)
@@ -362,17 +440,64 @@ def outline_to_docx_bytes(outline: list[dict]) -> bytes:
     return buf.read()
 
 
+def _docx_paragraph_level(paragraph, last_level: int) -> int:
+    """
+    Determine a docx paragraph's outline level.
+
+    Both Google Docs exports and our own outline_to_docx_bytes() output
+    encode nesting the same way: a paragraph's list level (w:numPr/w:ilvl)
+    *is* the outline level (0 = section, 1 = topic, 2+ = body). This is
+    checked first and is authoritative — paragraph *style* is not a
+    reliable signal on its own, since real minutes docs sometimes apply a
+    Heading style to a sub-item purely for visual emphasis while still
+    nesting it correctly via ilvl (e.g. a "Committee Updates" topic styled
+    as Heading 2 but at ilvl=1, not a real new section).
+
+    Falls back to:
+      - level 0 if the paragraph uses a Heading style and has no list level
+        at all (covers manually-typed headings with no bullets under them)
+      - the previous paragraph's level, to gracefully handle stray
+        unstyled/unbulleted paragraphs (e.g. blank formatting artifacts)
+    """
+    p_pr = paragraph._p.pPr
+    if p_pr is not None and p_pr.numPr is not None and p_pr.numPr.ilvl is not None:
+        return p_pr.numPr.ilvl.val
+
+    style_name = (paragraph.style.name or "") if paragraph.style else ""
+    if style_name.lower().startswith("heading") or style_name.lower() == "title":
+        return 0
+
+    return last_level
+
+
 def read_outline_file(file) -> list[str]:
     """
-    Read lines from an uploaded outline file.
-    Accepts both .docx (reads paragraphs) and .txt (splits on newline).
-    Tabs and spaces are both treated as indentation by _parse_level().
+    Read lines from an uploaded outline file, re-encoded as tab-indented
+    text (one leading \t per outline level) so downstream parsing always
+    goes through the unambiguous tab-count path in _parse_level(), never
+    the Roman/alpha/numeric prefix-guessing fallback.
+
+    .docx: level comes from each paragraph's real Word/Google Docs list
+    level and heading style (see _docx_paragraph_level) — this correctly
+    handles actual minutes docs (headings + native bulleted lists), not
+    just outline.docx files produced by Tab 1 itself.
+
+    .txt: passed through unchanged; _parse_level() handles tabs/prefixes.
     """
     name = getattr(file, "name", "")
     if name.lower().endswith(".docx"):
         from docx import Document
         doc = Document(file)
-        return [p.text for p in doc.paragraphs if p.text.strip()]
+        lines: list[str] = []
+        last_level = 0
+        for p in doc.paragraphs:
+            text = p.text.strip()
+            if not text:
+                continue
+            level = _docx_paragraph_level(p, last_level)
+            last_level = level
+            lines.append("\t" * level + text)
+        return lines
     return file.read().decode("utf-8").splitlines()
 
 
