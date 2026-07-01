@@ -685,26 +685,39 @@ def _match_section_prefix(title: str) -> str | None:
             return prefix
     return None
 
-def _format_body(lines: list[str]) -> str:
-    """Join body lines as a bulleted list. Always prefixed with • for consistency."""
-    return "\n".join(f"• {ln}" for ln in lines)
+_BODY_INDENT = "    "  # 4 spaces per relative nesting level within a topic's body
+
+def _format_body(items: list[tuple[int, str]]) -> str:
+    """
+    Render body lines as a bulleted list, preserving their nesting relative
+    to the topic. Level 2 (the first body level, directly under a topic) is
+    unindented; each level deeper adds one more indent step, so a line that
+    was nested three levels under its topic in the source outline stays
+    visually nested under its actual parent bullet, not flattened flush
+    with its siblings.
+    """
+    return "\n".join(
+        f"{_BODY_INDENT * max(lvl - 2, 0)}• {text}" for lvl, text in items
+    )
 
 def parse_meeting_sections(lines: list[str]) -> dict[str, dict]:
     """
     Parse outline lines into a dict keyed by section prefix:
         {
-          "Mem":  {"heading": "...", "topics": [("Topic text", "• body\n• body"), ...]},
+          "Mem":  {"heading": "...", "topics": [("Topic text", "• body\n    • body"), ...]},
           "Exec": {"heading": "...", "topics": [...]},
           ...
         }
 
     Levels A. (1) → Topic
-    Levels 1. / a) / (1) nested under a topic → all collected as body bullet lines.
+    Levels 1. / a) / (1) nested under a topic → collected as body bullet
+    lines, each tagged with its original level so relative nesting can be
+    reconstructed in the rendered body text (see _format_body).
     """
     sections: dict[str, dict] = {}
     current_prefix: str | None = None
     current_topic:  str | None = None
-    current_bodies: list[str]  = []
+    current_bodies: list[tuple[int, str]] = []
 
     def _flush_topic():
         """Save the buffered topic+bodies into the current section."""
@@ -732,8 +745,8 @@ def parse_meeting_sections(lines: list[str]) -> dict[str, dict]:
             current_bodies = []
 
         elif lvl >= 2 and current_prefix and current_topic is not None:
-            # 1. / a) / (1) → body content for the current topic
-            current_bodies.append(text)
+            # 1. / a) / (1) → body content for the current topic, depth-tagged
+            current_bodies.append((lvl, text))
 
     _flush_topic()                                     # flush final topic
     return sections
